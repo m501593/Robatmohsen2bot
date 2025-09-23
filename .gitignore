@@ -1,20 +1,7 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+.env
+.venv
+.envrc
 *.db
-*.sqlite3
-
-# Virtual environment
-.venv/
-venv/
-env/
-
-# System
 .DS_Store
-Thumbs.db
-
-# Config / secrets
-config_local.py
-*.env
