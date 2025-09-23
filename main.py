@@ -1,58 +1,55 @@
-# main.py
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.executor import start_webhook
 
-# 🔑 توکن و آیدی مدیر (از اطلاعاتی که دادی)
 API_TOKEN = "7993216439:AAHKSHJMHrcnfEcedw54aetp1JPxZ83Ks4M"
 ADMIN_ID = 84544682
 
-# 🌐 تنظیمات وبهوک برای Render
-WEBHOOK_HOST = "https://robatmohsen2bot.onrender.com"  # آدرس سرویس Render
+# Webhook settings
+WEBHOOK_HOST = "https://robatmohsen2bot.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = 10000  # Render خودش مقدار PORT میده
+WEBAPP_PORT = 10000
 
-# 📜 لاگینگ
 logging.basicConfig(level=logging.INFO)
 
-# 🤖 راه‌اندازی ربات
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# ✅ دستور start
+# start command
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ دسترسی نداری")
+        await message.answer("⛔ Access denied")
         return
-    await message.answer("✅ ربات روشنه و آماده‌ست")
+    await message.answer("✅ Bot is running")
 
-# 📊 هندلر پیام‌ها
+# handle messages
 @dp.message_handler()
 async def handle_msg(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
 
     response = f"""
-📊 جفت ارز: BTC/USDT
-⏱ تایم‌فریم: اینترادی
-🎯 ورود: 27,450 USDT
-🛑 حد ضرر: 27,100 USDT
-🎯 حد سود (TP1): 27,900 USDT
-🎯 حد سود (TP2): 28,300 USDT
-⚠️ ریسک پایین، تایید بر اساس اصلاح صعودی
+📊 Pair: BTC/USDT
+⏰ Timeframe: Intraday
+🎯 Entry: 27,450 USDT
+🛑 Stop Loss: 27,100 USDT
+🎯 Take Profit 1: 27,900 USDT
+🎯 Take Profit 2: 28,300 USDT
+⚠️ Low risk setup based on bullish correction
 """
     await message.answer(response)
 
-# 🚀 استارت وبهوک
+# startup webhook
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
 
+# shutdown webhook
 async def on_shutdown(dp):
-    logging.warning("Shutting down...")
+    logging.warning("Shutting down..")
     await bot.delete_webhook()
     await bot.close()
 
