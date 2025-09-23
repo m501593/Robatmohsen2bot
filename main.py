@@ -1,792 +1,674 @@
 # main.py
-import asyncio
-import logging
-import math
-import time
-from datetime import datetime, timezone
-from typing import Dict, Any, Tuple, List
+# Single-file Binance futures scanner + Telegram notifier (webhook-ready)
+# Code uses English identifiers/comments. Telegram messages in Persian.
+# Inserted TELEGRAM_TOKEN and ADMIN_ID as provided by user.
 
-import aiohttp
+import os
+import time
+import math
+import json
+import sqlite3
+import logging
+import threading
+from datetime import datetime
+from typing import Dict, Any, List
+
+import requests
 import numpy as np
 import pandas as pd
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import exceptions
-from aiogram.utils.executor import start_webhook
+import ta
+from flask import Flask, request, jsonify
 
-import config  # your config.py with TELEGRAM_TOKEN, ADMIN_ID, WATCHLIST, ...
+# ================== CONFIG (user-provided token & chat id inserted) ==================
+TELEGRAM_TOKEN = "7993216439:AAHKSHJMHrcnfEcedw54aetp1JPxZ83Ks4M"  # provided by user
+ADMIN_ID = 84544682  # provided by user (numeric chat id)
 
-# -------------------------
-# Logging
-# -------------------------
-logging.basicConfig(level=logging.INFO)
+# Webhook / hosting config
+# Best: set WEBHOOK_HOST as environment variable to your service URL (e.g. https://your-render-app.onrender.com)
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")  # if empty, webhook won't be set automatically
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
+
+# App host/port (Render provides PORT env variable)
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", "10000"))
+
+# Binance endpoints
+BINANCE_SPOT = "https://api.binance.com"
+BINANCE_FUT = "https://fapi.binance.com"
+
+# runtime params
+TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+AUTO_SCAN_TOP_N = int(os.getenv("AUTO_SCAN_TOP_N", "100"))
+PROBABILITY_THRESHOLD = int(os.getenv("PROBABILITY_THRESHOLD", "50"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+WATCHLIST_ENV = os.getenv("WATCHLIST", "")
+WATCHLIST = [s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.strip()] or ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","LINKUSDT"]
+
+MAX_SCORE = 134
+SCORE_STRONG = 100
+SCORE_GOOD = 80
+SCORE_WEAK = 60
+
+DB_PATH = os.getenv("DB_PATH", "signals.db")
+ENABLE_AUTO_SCAN = os.getenv("ENABLE_AUTO_SCAN", "True").lower() in ("1","true","yes")
+ENABLE_WEBHOOK = os.getenv("ENABLE_WEBHOOK", "True").lower() in ("1","true","yes")
+
+# Weight map (approximate; sum near MAX_SCORE)
+WEIGHTS = {
+    "trend": 15, "structure": 12, "price_action": 12, "volume": 10, "rsi": 8,
+    "macd": 8, "multi_tf": 8, "funding_oi": 8, "news": 7, "liquidity": 7,
+    "order_flow": 5, "liquidity_pool": 5, "vwap": 3, "volatility": 3, "correlation": 5,
+    "monthly_bias": 5, "longshort_ratio": 5, "time_of_day": 3,
+    "position_sizing": 3, "psych": 2, "backtest": 2, "regime": 3, "asset_specific": 2,
+    "smart_money": 3, "ml": 2
+}
+
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("scanner")
 
-# -------------------------
-# Bot init
-# -------------------------
-bot = Bot(token=config.TELEGRAM_TOKEN)
-dp = Dispatcher(bot)
+# ---------------- DB ----------------
+def init_db(path: str = DB_PATH):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            symbol TEXT,
+            score REAL,
+            category TEXT,
+            direction TEXT,
+            probability INTEGER,
+            details TEXT
+        )
+    """)
+    conn.commit()
+    return conn
 
-# aiohttp session used across requests
-_http_session: aiohttp.ClientSession = None
+DB_CONN = init_db(DB_PATH)
 
-
-async def get_session() -> aiohttp.ClientSession:
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
-    return _http_session
-
-
-# -------------------------
-# Helpers - numeric / indicator
-# -------------------------
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period, min_periods=1).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-
-def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h_l = df['high'] - df['low']
-    h_pc = (df['high'] - df['close'].shift()).abs()
-    l_pc = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-    return tr.rolling(window=period, min_periods=1).mean()
-
-
-def vwap(df: pd.DataFrame) -> pd.Series:
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    v = df['volume']
-    return (tp * v).cumsum() / (v.cumsum() + 1e-9)
-
-
-def obv(df: pd.DataFrame) -> pd.Series:
-    direction = np.sign(df['close'].diff()).fillna(0)
-    return (direction * df['volume']).cumsum()
-
-
-def stoch_rsi(rsi_series: pd.Series, k_period=14, d_period=3):
-    min_r = rsi_series.rolling(k_period).min()
-    max_r = rsi_series.rolling(k_period).max()
-    k = 100 * (rsi_series - min_r) / (max_r - min_r + 1e-9)
-    d = k.rolling(d_period).mean()
-    return k, d
-
-
-# -------------------------
-# Binance fetchers (futures)
-# -------------------------
-BINANCE_FAPI = "https://fapi.binance.com"
-
-async def fetch_klines_binance(symbol: str, interval: str = "1h", limit: int = 500) -> pd.DataFrame:
-    """
-    returns DataFrame with columns: open_time, open, high, low, close, volume (float)
-    """
-    session = await get_session()
-    url = f"{BINANCE_FAPI}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def save_signal(symbol: str, score: float, category: str, direction: str, probability: int, details: Dict[str,Any]):
     try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                logger.warning("Binance klines failed %s %s", symbol, resp.status)
-                return pd.DataFrame()
-            data = await resp.json()
-    except Exception as e:
-        logger.exception("fetch_klines_binance error %s", e)
-        return pd.DataFrame()
+        cur = DB_CONN.cursor()
+        cur.execute(
+            "INSERT INTO signals (ts, symbol, score, category, direction, probability, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(), symbol, score, category, direction, probability, json.dumps(details, ensure_ascii=False))
+        )
+        DB_CONN.commit()
+    except Exception:
+        logger.exception("Failed to save signal")
 
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+# ---------------- HTTP helper ----------------
+def safe_get(url: str, params: dict = None, timeout: int = 15):
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        logger.debug("HTTP GET failed: %s %s", url, params, exc_info=True)
+        return None
+
+# ---------------- Binance data fetchers ----------------
+def get_klines(symbol: str, interval: str="15m", limit: int=200, futures: bool = True) -> pd.DataFrame:
+    base = BINANCE_FUT if futures else BINANCE_SPOT
+    url = f"{base}/api/v3/klines"
+    res = safe_get(url, params={"symbol": symbol, "interval": interval, "limit": limit})
+    if not res:
+        raise RuntimeError(f"No klines for {symbol}@{interval}")
+    df = pd.DataFrame(res, columns=[
+        "open_time","open","high","low","close","volume","close_time","quote_av","trades","taker_base","taker_quote","ignore"
     ])
-    # convert types
-    for col in ["open", "high", "low", "close", "volume", "taker_buy_base", "taker_buy_quote"]:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df
 
+def get_24hr_tickers():
+    url = f"{BINANCE_SPOT}/api/v3/ticker/24hr"
+    res = safe_get(url)
+    return res or []
 
-async def fetch_recent_trades(symbol: str, limit: int = 1000) -> List[Dict[str, Any]]:
-    session = await get_session()
-    url = f"{BINANCE_FAPI}/fapi/v1/aggTrades?symbol={symbol}&limit={limit}"
-    try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                return []
-            return await resp.json()
-    except Exception:
-        return []
+def get_funding_rate(symbol: str):
+    url = f"{BINANCE_FUT}/fapi/v1/premiumIndex"
+    res = safe_get(url, params={"symbol": symbol})
+    if res and isinstance(res, dict):
+        return float(res.get("lastFundingRate", 0.0))
+    return None
 
+def get_open_interest(symbol: str):
+    url = f"{BINANCE_FUT}/fapi/v1/openInterest"
+    res = safe_get(url, params={"symbol": symbol})
+    if res and "openInterest" in res:
+        return float(res["openInterest"])
+    return None
 
-async def fetch_depth(symbol: str, limit: int = 20) -> Dict[str, Any]:
-    session = await get_session()
-    url = f"{BINANCE_FAPI}/fapi/v1/depth?symbol={symbol}&limit={limit}"
-    try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                return {}
-            return await resp.json()
-    except Exception:
-        return {}
+def get_order_book(symbol: str, limit: int = 20):
+    url = f"{BINANCE_SPOT}/api/v3/depth"
+    res = safe_get(url, params={"symbol": symbol, "limit": limit})
+    return res
 
+# ---------------- indicators ----------------
+def ema(series: pd.Series, window: int):
+    return ta.trend.EMAIndicator(series, window=window).ema_indicator()
 
-async def fetch_funding_and_oi(symbol: str) -> Tuple[float, float]:
+def rsi(series: pd.Series, window: int=14):
+    return ta.momentum.RSIIndicator(series, window=window).rsi()
+
+def macd_diff(series: pd.Series):
+    return ta.trend.MACD(series).macd_diff()
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int=14):
+    return ta.volatility.AverageTrueRange(high, low, close, window=window).average_true_range()
+
+def vwap(df: pd.DataFrame):
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    cumtyp = (typical * df["volume"]).cumsum()
+    cumvol = df["volume"].cumsum()
+    return cumtyp / cumvol
+
+# ---------------- scoring (25 metrics simplified) ----------------
+def score_symbol(symbol: str) -> Dict[str,Any]:
     """
-    Returns (fundingRate, openInterest)
+    Compute composite score across multiple heuristics.
+    Returns dict:
+      {score, category, direction, probability, entry, sl, tp1, tp2, details}
     """
-    session = await get_session()
-    funding_url = f"{BINANCE_FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    oi_url = f"{BINANCE_FAPI}/fapi/v1/openInterest?symbol={symbol}"
-    funding = 0.0
-    oi = 0.0
     try:
-        async with session.get(funding_url, timeout=10) as resp:
-            if resp.status == 200:
-                j = await resp.json()
-                funding = float(j.get("lastFundingRate", 0.0))
-    except Exception:
-        pass
-    try:
-        async with session.get(oi_url, timeout=10) as resp:
-            if resp.status == 200:
-                j = await resp.json()
-                oi = float(j.get("openInterest", 0.0))
-    except Exception:
-        pass
-    return funding, oi
-
-
-# -------------------------
-# Scoring: mapping of 25 metrics into numeric score
-# -------------------------
-# We'll map to a max_total consistent with your design (~134).
-WEIGHTS = {
-    # Core technical (10)
-    "trend": 15,
-    "market_structure": 12,
-    "price_action": 12,
-    "volume": 10,
-    "rsi": 8,
-    "macd": 8,
-    "multi_tf": 8,
-    "funding_oi": 8,
-    "news": 7,  # optional/manual
-    "liquidity": 7,
-
-    # Advanced (8)
-    "order_flow": 5,
-    "liquidity_pools": 5,
-    "vwap": 3,
-    "volatility": 3,
-    "correlation": 5,
-    "monthly_bias": 5,
-    "long_short_ratio": 5,
-    "session": 3,
-
-    # Stabilizers (7)
-    "position_sizing": 3,
-    "psych": 1,
-    "backtest": 1,
-    "regime": 2,
-    "asset_specific": 2,
-    "smc": 2,
-    "ml": 1
-}
-MAX_SCORE = sum(WEIGHTS.values())
-
-
-def normalize_to_100(x: float) -> float:
-    # map 0..MAX_SCORE to 0..100
-    return max(0.0, min(100.0, (x / MAX_SCORE) * 100.0))
-
-
-def compute_support_resistance(df: pd.DataFrame) -> Tuple[float, float]:
-    # Simple approach: highest highs and lowest lows from last N
-    lookback = min(len(df), 200)
-    if lookback < 5:
-        return (float(df['close'].iloc[-1]), float(df['close'].iloc[-1]))
-    highs = df['high'][-lookback:]
-    lows = df['low'][-lookback:]
-    resistance = float(highs.max())
-    support = float(lows.min())
-    return support, resistance
-
-
-async def score_symbol(symbol: str, interval: str = "1h") -> Dict[str, Any]:
-    """
-    Compute full 25-metric score and return details
-    """
-    df = await fetch_klines_binance(symbol, interval=interval, limit=500)
-    if df.empty:
-        # fallback: try smaller limit / return minimal
-        return {"symbol": symbol, "score": 0, "details": "no data", "components": {}}
-
-    # compute indicators
-    close = df['close']
-    ema50 = ema(close, 50)
-    ema200 = ema(close, 200)
-    macd_line, macd_signal, macd_hist = macd(close)
-    rsi_series = rsi(close, period=14)
-    atr_series = atr(df, period=14)
-    vwap_series = vwap(df)
-    obv_series = obv(df)
-    stoch_k, stoch_d = stoch_rsi(rsi_series)
-
-    last_close = float(close.iloc[-1])
-    last_rsi = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 else 50.0
-    last_macd_hist = float(macd_hist.iloc[-1]) if len(macd_hist) > 0 else 0.0
-    last_atr = float(atr_series.iloc[-1]) if len(atr_series) > 0 else 0.0
-    last_vwap = float(vwap_series.iloc[-1]) if len(vwap_series) > 0 else last_close
-    last_obv = float(obv_series.iloc[-1]) if len(obv_series) > 0 else 0.0
-
-    # support / resistance
-    support, resistance = compute_support_resistance(df)
-
-    # recent trades -> order flow proxy
-    trades = await fetch_recent_trades(symbol, limit=500)
-    buys = 0
-    sells = 0
-    for t in trades:
-        # aggTrades format: 'm' field indicates maker? use taker_is_buyer? (agg doesn't include taker flag)
-        # many aggTrades don't have isBuyerMaker; safe fallback using price movement: can't be precise
-        # We'll use taker_buy_base if available in klines summary
-        pass
-    # quick proxy: compare taker_buy_base in recent klines
-    recent_taker_buy = df['taker_buy_base'].tail(20).sum()
-    recent_volume = df['volume'].tail(20).sum()
-    buy_ratio = (recent_taker_buy / (recent_volume + 1e-9)) if recent_volume > 0 else 0.5
-
-    # funding and open interest
-    funding, oi = await fetch_funding_and_oi(symbol)
-
-    # liquidity: depth snapshot
-    depth = await fetch_depth(symbol, limit=20)
-    bid_depth = sum([float(x[1]) for x in depth.get('bids', [])[:10]]) if depth else 0.0
-    ask_depth = sum([float(x[1]) for x in depth.get('asks', [])[:10]]) if depth else 0.0
-    spread = 0.0
-    if depth and depth.get('bids') and depth.get('asks'):
-        best_bid = float(depth['bids'][0][0])
-        best_ask = float(depth['asks'][0][0])
-        spread = (best_ask - best_bid) / ((best_ask + best_bid) / 2 + 1e-9)
-
-    # multi-timeframe check: check EMA50 vs EMA200 on HTF (we'll use same df but can simulate HTF by resampling)
-    # For simplicity: use last 4H (every 4th candle) as HTF approx when interval is 1h or less
-    multi_tf_score = 0
-    try:
-        if len(df) >= 200:
-            # get HTF by resampling every 4 bars as proxy for 4h
-            htf_close = df['close'].resample('4H', on='open_time').last() if 'open_time' in df.columns else df['close']
-            if len(htf_close) > 10:
-                htf_ema50 = ema(htf_close, 50).iloc[-1]
-                htf_ema200 = ema(htf_close, 200).iloc[-1] if len(htf_close) >= 200 else ema(htf_close, 200).iloc[-1]
-                if htf_ema50 > htf_ema200:
-                    multi_tf_score = WEIGHTS['multi_tf']
-    except Exception:
-        multi_tf_score = 0
-
-    components = {}
-
-    # 1. Trend (EMA200 on HTF) approximate
-    trend_score = 0
-    if ema50.iloc[-1] >= ema200.iloc[-1]:
-        # price above ema200? strong
-        trend_score = WEIGHTS['trend']
-    elif abs(ema50.iloc[-1] - ema200.iloc[-1]) / (ema200.iloc[-1] + 1e-9) < 0.02:
-        trend_score = WEIGHTS['trend'] / 2
-    else:
-        trend_score = 0
-    components['trend'] = trend_score
-
-    # 2. Market structure (HH/HL or LH/LL) simple heuristic
-    ms_score = 0
-    look = 20
-    highs = df['high'].tail(look).values
-    lows = df['low'].tail(look).values
-    if len(highs) >= 6:
-        # check simple HH/HL
-        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
-            ms_score = WEIGHTS['market_structure']
-        else:
-            ms_score = WEIGHTS['market_structure'] / 2
-    components['market_structure'] = ms_score
-
-    # 3. Price action: presence of strong bullish/bearish candle on support/resistance
-    pa_score = 0
-    last_open = df['open'].iloc[-1]
-    last_high = df['high'].iloc[-1]
-    last_low = df['low'].iloc[-1]
-    last_close_val = df['close'].iloc[-1]
-    body = abs(last_close_val - last_open)
-    candle_range = last_high - last_low + 1e-9
-    body_ratio = body / candle_range
-    # bullish engulfing proxy
-    if last_close_val > last_open and body_ratio > 0.6 and last_close_val > last_open:
-        pa_score = WEIGHTS['price_action']
-    else:
-        pa_score = WEIGHTS['price_action'] / 2
-    components['price_action'] = pa_score
-
-    # 4. Volume
-    vol_score = 0
-    recent_vol = df['volume'].tail(20)
-    if len(recent_vol) > 0:
-        if recent_vol.iloc[-1] > recent_vol.mean():
-            vol_score = WEIGHTS['volume']
-        else:
-            vol_score = WEIGHTS['volume'] / 3
-    components['volume'] = vol_score
-
-    # 5. RSI
-    rsi_score = 0
-    if last_rsi > 55:
-        rsi_score = WEIGHTS['rsi']
-    elif last_rsi < 45:
-        # negative for long but could be positive for short; for scoring give half
-        rsi_score = WEIGHTS['rsi'] / 2
-    else:
-        rsi_score = WEIGHTS['rsi'] / 3
-    components['rsi'] = rsi_score
-
-    # 6. MACD
-    macd_score = 0
-    if macd_line.iloc[-1] > macd_signal.iloc[-1] and last_macd_hist > 0:
-        macd_score = WEIGHTS['macd']
-    elif last_macd_hist > 0:
-        macd_score = WEIGHTS['macd'] / 2
-    components['macd'] = macd_score
-
-    # 7. Multi-timeframe (already computed)
-    components['multi_tf'] = multi_tf_score
-
-    # 8. Funding + OI
-    funding_score = 0
-    # neutral funding near zero gives positive; extreme funding reduces
-    if abs(funding) < 0.0005:
-        funding_score = WEIGHTS['funding_oi']
-    elif abs(funding) < 0.001:
-        funding_score = WEIGHTS['funding_oi'] / 2
-    else:
-        funding_score = 0
-    components['funding_oi'] = funding_score
-
-    # 9. News/events - config flag
-    components['news'] = WEIGHTS['news'] if getattr(config, "NEWS_ALLOW", False) else 0
-
-    # 10. Liquidity/depth/spread
-    liquidity_score = 0
-    if spread < 0.005 and (bid_depth + ask_depth) > 0:
-        liquidity_score = WEIGHTS['liquidity']
-    elif (bid_depth + ask_depth) > 0:
-        liquidity_score = WEIGHTS['liquidity'] / 2
-    components['liquidity'] = liquidity_score
-
-    # 11. Order flow (proxy by taker buy ratio)
-    order_flow_score = 0
-    if buy_ratio > 0.55:
-        order_flow_score = WEIGHTS['order_flow']
-    elif buy_ratio > 0.5:
-        order_flow_score = WEIGHTS['order_flow'] / 2
-    components['order_flow'] = order_flow_score
-
-    # 12. Liquidity pools / stophunt (proxied by big recent wick)
-    liquidity_pools_score = 0
-    # detect big wick last candle
-    wick_top = float(df['high'].iloc[-1] - df['close'].iloc[-1])
-    wick_bottom = float(df['open'].iloc[-1] - df['low'].iloc[-1])
-    if wick_bottom > last_atr * 0.8 or wick_top > last_atr * 0.8:
-        liquidity_pools_score = WEIGHTS['liquidity_pools'] / 1.5
-    components['liquidity_pools'] = liquidity_pools_score
-
-    # 13. VWAP
-    vwap_score = 0
-    if last_close >= last_vwap:
-        vwap_score = WEIGHTS['vwap']
-    else:
-        vwap_score = 0
-    components['vwap'] = vwap_score
-
-    # 14. Volatility (ATR)
-    volatility_score = 0
-    # moderate ATR preferred; just assign small points
-    volatility_score = WEIGHTS['volatility']
-    components['volatility'] = volatility_score
-
-    # 15. Correlation with BTC (if symbol is alt)
-    correlation_score = 0
-    try:
-        if symbol != "BTCUSDT" and "BTCUSDT" in config.WATCHLIST:
-            btc_df = await fetch_klines_binance("BTCUSDT", interval=interval, limit=500)
-            if not btc_df.empty:
-                corr = float(np.corrcoef(df['close'].tail(100), btc_df['close'].tail(100))[0, 1])
-                if corr > 0.6:
-                    correlation_score = WEIGHTS['correlation']
-                elif corr > 0.3:
-                    correlation_score = WEIGHTS['correlation'] / 2
-    except Exception:
-        correlation_score = 0
-    components['correlation'] = correlation_score
-
-    # 16. Monthly/Weekly bias - simplified using long EMA on whole df
-    monthly_bias_score = 0
-    if len(df) >= 200:
-        if ema(df['close'], 50).iloc[-1] > ema(df['close'], 200).iloc[-1]:
-            monthly_bias_score = WEIGHTS['monthly_bias']
-    components['monthly_bias'] = monthly_bias_score
-
-    # 17. Long/Short ratio (proxy from funding sign and buy_ratio)
-    ls_score = WEIGHTS['long_short_ratio'] if (abs(buy_ratio - 0.5) < 0.2) else WEIGHTS['long_short_ratio'] / 2
-    components['long_short_ratio'] = ls_score
-
-    # 18. Session/time-of-day
-    session_score = 0
-    utc_hour = datetime.utcnow().hour
-    # Favor overlaps: 12-16 UTC roughly (London + NY overlap)
-    if 12 <= utc_hour <= 16:
-        session_score = WEIGHTS['session']
-    components['session'] = session_score
-
-    # 19. Position sizing - optional
-    components['position_sizing'] = WEIGHTS['position_sizing'] if getattr(config, "ENABLE_POS_SIZING", False) else 0
-
-    # 20. Psychology check: rely on config flag (user must confirm)
-    components['psych'] = WEIGHTS['psych'] if getattr(config, "USER_CONFIRMED", True) else 0
-
-    # 21. Backtest flag: small bonus if enabled
-    components['backtest'] = WEIGHTS['backtest'] if getattr(config, "HAS_BACKTEST", False) else 0
-
-    # 22. Regime detection (ATR relative)
-    regime_score = 0
-    avg_atr = atr_series.tail(50).mean() if len(atr_series) > 0 else last_atr
-    if last_atr < avg_atr:
-        regime_score = WEIGHTS['regime']  # calmer market
-    components['regime'] = regime_score
-
-    # 23. Asset-specific rules: from config per-symbol overrides
-    components['asset_specific'] = WEIGHTS['asset_specific']
-
-    # 24. Smart Money Concepts (proxy)
-    smc_score = 0
-    # if big wick + retest near level, small bonus
-    if (wick_bottom > last_atr * 0.6) or (wick_top > last_atr * 0.6):
-        smc_score = WEIGHTS['smc'] / 1.5
-    components['smc'] = smc_score
-
-    # 25. ML model (optional)
-    components['ml'] = WEIGHTS['ml'] if getattr(config, "ENABLE_ML", False) else 0
-
-    # Sum all components
-    total_raw = sum(components.values())
-    normalized = normalize_to_100(total_raw)
-
-    # compute direction: long if ema50>ema200 and other confirmations
-    direction = "LONG" if ema50.iloc[-1] > ema200.iloc[-1] else "SHORT"
-
-    # Build price targets: ATR-based simple
-    if direction == "LONG":
-        sl = round(last_close - 1.5 * last_atr, 2)
-        tp1 = round(last_close + 1.0 * last_atr, 2)
-        tp2 = round(last_close + 2.0 * last_atr, 2)
-    else:
-        sl = round(last_close + 1.5 * last_atr, 2)
-        tp1 = round(last_close - 1.0 * last_atr, 2)
-        tp2 = round(last_close - 2.0 * last_atr, 2)
-
-    # risk reward approx
-    rr = None
-    try:
-        if direction == "LONG":
-            rr = abs((tp1 - last_close) / (last_close - sl + 1e-9))
-        else:
-            rr = abs((last_close - tp1) / (sl - last_close + 1e-9))
-        rr = round(rr, 2)
-    except Exception:
-        rr = None
-
-    # Compose details to return
-    result = {
-        "symbol": symbol,
-        "score_raw": total_raw,
-        "score_norm": round(normalized, 1),
-        "direction": direction,
-        "last_price": last_close,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "support": round(support, 2),
-        "resistance": round(resistance, 2),
-        "funding": funding,
-        "open_interest": oi,
-        "components": components,
-        "indicators": {
-            "rsi": round(last_rsi, 1),
-            "macd_hist": round(last_macd_hist, 6),
-            "ema50": round(float(ema50.iloc[-1]), 2),
-            "ema200": round(float(ema200.iloc[-1]), 2),
-            "atr": round(last_atr, 4),
-            "vwap": round(last_vwap, 2),
-            "obv": round(last_obv, 2),
-            "buy_ratio": round(buy_ratio, 3),
-            "spread": round(spread, 6),
-        }
-    }
-    return result
-
-
-# -------------------------
-# Message formatting (Persian)
-# -------------------------
-def format_signal_message(res: Dict[str, Any], timeframe: str = "1h") -> str:
-    # Build Persian message matching screenshots
-    sym = res['symbol']
-    last_price = res['last_price']
-    dir_fa = "لانگ" if res['direction'] == "LONG" else "شورت"
-    score = res['score_norm']
-    prob = f"{int(score)}%"
-    entry = f"USDT {res['last_price']:,}"
-    support = f"USDT {res['support']:,}"
-    resistance = f"USDT {res['resistance']:,}"
-    sl = f"USDT {res['sl']:,}"
-    tp1 = f"USDT {res['tp1']:,}"
-    tp2 = f"USDT {res['tp2']:,}"
-    rr = res['rr'] if res['rr'] is not None else "-"
-    funding = res['funding']
-    oi = res['open_interest']
-
-    # Indicators summary
-    ind = res['indicators']
-    ind_lines = []
-    ind_lines.append(f"🔎 تحلیل اندیکاتورها:")
-    ind_lines.append(f"📈 RSI: نزدیک {ind['rsi']} → {'ممنتوم مثبت' if ind['rsi']>=50 else 'ضعیف'}")
-    ind_lines.append(f"📊 MACD hist: {ind['macd_hist']}")
-    ind_lines.append(f"📐 EMA50/EMA200: {res['indicators']['ema50']} / {res['indicators']['ema200']}")
-    ind_lines.append(f"🧮 حجم: نسبت خرید % {int(ind['buy_ratio']*100)} - OI: {int(oi)}")
-    ind_block = "\n".join(ind_lines)
-
-    header = f"⚡️ جفت ارز: {sym}\n⏱ تایم‌فریم: {timeframe}\n📌 وضعیت بازار: {dir_fa}\n🔢 امتیاز: {score} / 100\n🔮 احتمال: {prob}\n🔁 نسبت ریسک/ریوارد: {rr}\n"
-    body = f"🔑 سطح کلیدی: {resistance}\n⏱ زمان مناسب برای ورود: بعد از اصلاح کوچک\n📌 زمان نگهداری: چند ساعت\n\n🔵 ورود: {entry}\n🔴 حد ضرر: {sl}\n🎯 حد سود (TP1): {tp1}\n🎯 حد سود (TP2): {tp2}\n⚠️ هشدار: ریسک پایین؛ تایید بر اساس اصلاح صعودی\n\n" + ind_block
-    return header + "\n" + body
-
-
-# -------------------------
-# Bot commands
-# -------------------------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer("سلام 👋\nربات سیگنال‌ساز آماده‌ست.\nبرای تحلیل سریع یک نماد بنویس:\n/scan BTC\nبرای دریافت گزارش کامل: /status BTC")
-
-
-@dp.message_handler(commands=["scan"])
-async def cmd_scan(message: types.Message):
-    try:
-        parts = message.text.strip().split()
-        if len(parts) < 2:
-            await message.reply("فرمت: /scan SYMBOL  (مثال: /scan BTC)")
-            return
-        symbol_raw = parts[1].upper()
-        if not symbol_raw.endswith("USDT"):
-            symbol = symbol_raw + "USDT"
-        else:
-            symbol = symbol_raw
-        await message.reply(f"در حال تحلیل {symbol} ... ⏳")
-        res = await score_symbol(symbol, interval=config.DEFAULT_INTERVAL)
-        msg = format_signal_message(res, timeframe=config.DEFAULT_INTERVAL)
-        await message.answer(msg)
-    except Exception as e:
-        logger.exception("scan command error")
-        await message.reply("خطا هنگام تحلیل. لطفا بعدا امتحان کنید.")
-
-
-@dp.message_handler(commands=["status"])
-async def cmd_status(message: types.Message):
-    # detailed score per component
-    try:
-        parts = message.text.strip().split()
-        if len(parts) < 2:
-            await message.reply("فرمت: /status SYMBOL")
-            return
-        symbol_raw = parts[1].upper()
-        if not symbol_raw.endswith("USDT"):
-            symbol = symbol_raw + "USDT"
-        else:
-            symbol = symbol_raw
-        await message.reply(f"در حال اجرای گزارش برای {symbol} ...")
-        res = await score_symbol(symbol, interval=config.DEFAULT_INTERVAL)
-        comp = res.get("components", {})
-        lines = [f"📋 گزارش امتیاز‌ها برای {symbol} (نرمال‌شده: {res['score_norm']}%)"]
-        for k, v in comp.items():
-            lines.append(f"• {k}: {round(float(v), 2)}")
-        lines.append("\n" + format_signal_message(res, timeframe=config.DEFAULT_INTERVAL))
-        await message.answer("\n".join(lines))
-    except Exception:
-        logger.exception("status command")
-        await message.reply("خطا در تولید گزارش.")
-
-
-@dp.message_handler(commands=["subscribe"])
-async def cmd_subscribe(message: types.Message):
-    # simple subscribe: add chat id to subscribers file (minimal)
-    cid = str(message.chat.id)
-    try:
-        subs = set()
-        try:
-            with open("subscribers.txt", "r") as f:
-                subs = set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            subs = set()
-        subs.add(cid)
-        with open("subscribers.txt", "w") as f:
-            f.write("\n".join(subs))
-        await message.reply("شما عضو لیست اطلاع‌رسانی شدید ✅")
-    except Exception:
-        await message.reply("خطا در عضویت.")
-
-
-@dp.message_handler(commands=["unsubscribe"])
-async def cmd_unsubscribe(message: types.Message):
-    cid = str(message.chat.id)
-    try:
-        subs = set()
-        try:
-            with open("subscribers.txt", "r") as f:
-                subs = set(line.strip() for line in f if line.strip())
-        except FileNotFoundError:
-            subs = set()
-        if cid in subs:
-            subs.remove(cid)
-        with open("subscribers.txt", "w") as f:
-            f.write("\n".join(subs))
-        await message.reply("شما از لیست اطلاع‌رسانی حذف شدید ✅")
-    except Exception:
-        await message.reply("خطا در عملیات حذف.")
-
-
-# -------------------------
-# Auto-scan task (periodic)
-# -------------------------
-async def send_signal_to_subscribers(text: str):
-    # send message to admin and subscribers
-    recipients = {str(config.ADMIN_ID)}
-    # add file subscribers
-    try:
-        with open("subscribers.txt", "r") as f:
-            for line in f:
-                if line.strip():
-                    recipients.add(line.strip())
-    except FileNotFoundError:
-        pass
-
-    for r in recipients:
-        try:
-            await bot.send_message(int(r), text)
-        except exceptions.BotBlocked:
-            logger.warning("Bot blocked by %s", r)
-        except Exception as e:
-            logger.exception("Failed send to %s: %s", r, e)
-
-
-async def auto_scan_task():
-    logger.info("Auto-scan started (top %s every %s seconds)", config.AUTO_SCAN_TOP_N, config.SCAN_INTERVAL_SECONDS)
-    while True:
-        start = time.time()
-        tasks = []
-        watch = config.WATCHLIST[:config.AUTO_SCAN_TOP_N]
-        for symbol in watch:
-            # ensure symbol format
-            sym = symbol.upper()
-            if not sym.endswith("USDT"):
-                sym = sym + "USDT"
-            tasks.append(score_symbol(sym, interval=config.DEFAULT_INTERVAL))
-        # run concurrently with limit
-        results = []
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e:
-            logger.exception("auto_scan gather error: %s", e)
-            results = []
-        # evaluate results
-        for r in results:
-            if isinstance(r, Exception):
-                continue
+        # fetch base timeframe
+        base_tf = TIMEFRAMES[0]
+        df = get_klines(symbol, interval=base_tf, limit=200, futures=True)
+        if df is None or df.empty:
+            return {"error": "no data"}
+
+        last_price = float(df["close"].iloc[-1])
+
+        # collect higher timeframe dfs
+        dfs = {tf: None for tf in TIMEFRAMES}
+        dfs[base_tf] = df
+        for tf in TIMEFRAMES[1:]:
             try:
-                # r is dict
-                prob = r.get("score_norm", 0)
-                if prob >= config.PROBABILITY_THRESHOLD:
-                    msg = format_signal_message(r, timeframe=config.DEFAULT_INTERVAL)
-                    await send_signal_to_subscribers(msg)
+                dfs[tf] = get_klines(symbol, interval=tf, limit=200, futures=True)
             except Exception:
-                logger.exception("error processing result")
+                dfs[tf] = None
 
-        elapsed = time.time() - start
-        wait_for = max(5, config.SCAN_INTERVAL_SECONDS - elapsed)
-        await asyncio.sleep(wait_for)
+        total = 0.0
+        components = {}
 
+        # metric 1: trend (HTF EMA200 vs price)
+        trend_score = 0.0
+        htf = dfs.get("4h") or dfs.get("1d") or dfs.get("1h")
+        if htf is not None:
+            try:
+                ema50 = ema(htf["close"], 50).iloc[-1]
+                ema200 = ema(htf["close"], 200).iloc[-1]
+                if ema50 > ema200 and htf["close"].iloc[-1] > ema200:
+                    trend_score = WEIGHTS["trend"]
+                elif abs(htf["close"].iloc[-1] - ema200) / ema200 < 0.02:
+                    trend_score = WEIGHTS["trend"] * 0.5
+                else:
+                    trend_score = 0.0
+            except Exception:
+                trend_score = WEIGHTS["trend"] * 0.3
+        else:
+            trend_score = WEIGHTS["trend"] * 0.3
+        components["trend"] = round(trend_score,3)
+        total += trend_score
 
-# -------------------------
-# Startup / Shutdown
-# -------------------------
-async def on_startup(dispatcher):
-    logger.info("Starting up bot...")
-    # start auto_scan in background if enabled
-    if getattr(config, "ENABLE_AUTO_SCAN", True):
-        asyncio.create_task(auto_scan_task())
-
-    if getattr(config, "ENABLE_WEBHOOK", False):
+        # metric 2: structure (HH/HL or LH/LL simple)
+        structure_score = 0.0
         try:
-            await bot.set_webhook(config.WEBHOOK_URL)
-            logger.info("Webhook set: %s", config.WEBHOOK_URL)
+            highs = htf["high"].tail(6) if htf is not None else df["high"].tail(6)
+            lows = htf["low"].tail(6) if htf is not None else df["low"].tail(6)
+            if len(highs) >= 3:
+                if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+                    structure_score = WEIGHTS["structure"]
+                elif highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+                    structure_score = 0.0
+                else:
+                    structure_score = WEIGHTS["structure"] * 0.5
+            else:
+                structure_score = WEIGHTS["structure"] * 0.4
         except Exception:
-            logger.exception("Failed to set webhook")
+            structure_score = WEIGHTS["structure"] * 0.4
+        components["structure"] = round(structure_score,3)
+        total += structure_score
 
+        # metric 3: price action
+        pa_score = 0.0
+        try:
+            o1 = df["open"].iloc[-1]; c1 = df["close"].iloc[-1]
+            o2 = df["open"].iloc[-2]; c2 = df["close"].iloc[-2]
+            # bullish engulf
+            if (c1 > o1) and (c2 < o2) and (c1 > o2) and (o1 < c2):
+                pa_score += WEIGHTS["price_action"] * 0.9
+            # proximity to recent support
+            recent_low = df["low"].rolling(window=20).min().iloc[-2]
+            recent_high = df["high"].rolling(window=20).max().iloc[-2]
+            if recent_low and abs(last_price - recent_low) / recent_low < 0.01:
+                pa_score += WEIGHTS["price_action"] * 0.6
+            if recent_high and abs(last_price - recent_high) / recent_high < 0.01:
+                pa_score += 0.0
+        except Exception:
+            pa_score = WEIGHTS["price_action"] * 0.3
+        components["price_action"] = round(pa_score,3)
+        total += pa_score
 
-async def on_shutdown(dispatcher):
-    logger.info("Shutting down bot...")
+        # metric 4: volume
+        vol_score = 0.0
+        try:
+            vol = df["volume"]
+            sma20 = vol.rolling(window=20).mean().iloc[-1]
+            if sma20 and vol.iloc[-1] > sma20 * 1.2:
+                vol_score = WEIGHTS["volume"]
+            else:
+                vol_score = WEIGHTS["volume"] * 0.6
+        except Exception:
+            vol_score = WEIGHTS["volume"] * 0.5
+        components["volume"] = round(vol_score,3)
+        total += vol_score
+
+        # metric 5: RSI
+        rsi_score = 0.0
+        try:
+            rsi_val = rsi(df["close"], window=14).iloc[-1]
+            if rsi_val > 70:
+                rsi_score = -WEIGHTS["rsi"] * 0.5
+            elif 55 <= rsi_val <= 65:
+                rsi_score = WEIGHTS["rsi"]
+            elif rsi_val < 30:
+                rsi_score = WEIGHTS["rsi"] * 1.2
+            else:
+                rsi_score = WEIGHTS["rsi"] * 0.3
+        except Exception:
+            rsi_score = WEIGHTS["rsi"] * 0.2
+            rsi_val = None
+        components["rsi"] = round(rsi_score,3)
+        components["rsi_value"] = round(float(rsi_val) if rsi_val is not None else 0,2)
+        total += max(0, rsi_score)  # negative rsi_score handled later
+
+        # metric 6: MACD
+        macd_score = 0.0
+        try:
+            md = macd_diff(df["close"]).iloc[-1]
+            macd_score = WEIGHTS["macd"] if md > 0 else WEIGHTS["macd"] * 0.2
+        except Exception:
+            macd_score = WEIGHTS["macd"] * 0.3
+        components["macd"] = round(macd_score,3)
+        total += macd_score
+
+        # metric 7: multi-timeframe alignment
+        mtf_score = 0.0
+        try:
+            aligns = 0; checks = 0
+            for tf in ["1h","4h"]:
+                d = dfs.get(tf)
+                if d is None: continue
+                checks += 1
+                e50 = ema(d["close"], 50).iloc[-1]
+                e200 = ema(d["close"], 200).iloc[-1]
+                if e50 > e200: aligns += 1
+            if checks > 0:
+                mtf_score = WEIGHTS["multi_tf"] * (aligns / checks)
+            else:
+                mtf_score = WEIGHTS["multi_tf"] * 0.5
+        except Exception:
+            mtf_score = WEIGHTS["multi_tf"] * 0.4
+        components["multi_tf"] = round(mtf_score,3)
+        total += mtf_score
+
+        # metric 8: funding + open interest
+        f_score = 0.0
+        try:
+            fr = get_funding_rate(symbol)
+            if fr is None:
+                f_score = WEIGHTS["funding_oi"] * 0.6
+            else:
+                if abs(fr) < 0.0005:
+                    f_score = WEIGHTS["funding_oi"]
+                elif abs(fr) >= 0.001:
+                    f_score = WEIGHTS["funding_oi"] * 0.3
+                else:
+                    f_score = WEIGHTS["funding_oi"] * 0.6
+        except Exception:
+            f_score = WEIGHTS["funding_oi"] * 0.5
+        components["funding_oi"] = round(f_score,4)
+        total += f_score
+
+        # metric 9: news placeholder
+        news_score = WEIGHTS["news"] * 0.6
+        components["news"] = round(news_score,3)
+        total += news_score
+
+        # metric 10: liquidity / order book
+        liq_score = 0.0
+        try:
+            ob = get_order_book(symbol, limit=20)
+            if ob and "bids" in ob and "asks" in ob:
+                bid_depth = sum(float(b[1]) for b in ob["bids"][:10])
+                ask_depth = sum(float(a[1]) for a in ob["asks"][:10])
+                depth_ratio = min(bid_depth, ask_depth) / max(1.0, (bid_depth + ask_depth))
+                liq_score = WEIGHTS["liquidity"] * (0.5 + depth_ratio)
+            else:
+                liq_score = WEIGHTS["liquidity"] * 0.6
+        except Exception:
+            liq_score = WEIGHTS["liquidity"] * 0.5
+        components["liquidity"] = round(liq_score,3)
+        total += liq_score
+
+        # Section B (11..18) simplified implementations (order_flow, liquidity_pool, vwap, volatility, correlation, monthly_bias, longshort_ratio, time_of_day)
+        # 11. order_flow proxy
+        of_score = 0.0
+        try:
+            df1m = get_klines(symbol, interval="1m", limit=60, futures=True)
+            green = (df1m["close"] > df1m["open"]).sum()
+            red = (df1m["close"] < df1m["open"]).sum()
+            of_score = WEIGHTS["order_flow"] if green > red else WEIGHTS["order_flow"] * 0.4
+        except Exception:
+            of_score = WEIGHTS["order_flow"] * 0.4
+        components["order_flow"] = round(of_score,3)
+        total += of_score
+
+        # 12. liquidity_pool / stop-hunt proxy
+        lp_score = 0.0
+        try:
+            body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+            wick_bottom = min(df["close"].iloc[-1], df["open"].iloc[-1]) - df["low"].iloc[-1]
+            wick_top = df["high"].iloc[-1] - max(df["close"].iloc[-1], df["open"].iloc[-1])
+            if wick_bottom > body * 2:
+                lp_score = WEIGHTS["liquidity_pool"] * 0.8
+            elif wick_top > body * 2:
+                lp_score = WEIGHTS["liquidity_pool"] * 0.2
+            else:
+                lp_score = WEIGHTS["liquidity_pool"] * 0.5
+        except Exception:
+            lp_score = WEIGHTS["liquidity_pool"] * 0.4
+        components["liquidity_pool"] = round(lp_score,3)
+        total += lp_score
+
+        # 13. VWAP
+        vwap_score = 0.0
+        try:
+            dfh = get_klines(symbol, interval="1h", limit=24, futures=True)
+            vw = vwap(dfh).iloc[-1]
+            vwap_score = WEIGHTS["vwap"] if last_price > vw else WEIGHTS["vwap"] * 0.3
+        except Exception:
+            vwap_score = WEIGHTS["vwap"] * 0.5
+        components["vwap"] = round(vwap_score,3)
+        total += vwap_score
+
+        # 14. volatility (ATR relative)
+        vol_score = 0.0
+        try:
+            atr_val = atr(df["high"], df["low"], df["close"], window=14).iloc[-1]
+            rel = atr_val / last_price if last_price else 0
+            vol_score = WEIGHTS["volatility"] if rel > 0.02 else WEIGHTS["volatility"] * 0.6
+        except Exception:
+            vol_score = WEIGHTS["volatility"] * 0.5
+        components["volatility"] = round(vol_score,4)
+        total += vol_score
+
+        # 15. correlation to BTC (for alts)
+        corr_score = 0.0
+        try:
+            if not symbol.startswith("BTC"):
+                btc = get_klines("BTCUSDT", interval=base_tf, limit=len(df), futures=True)
+                ret_sym = df["close"].pct_change().dropna()
+                ret_btc = btc["close"].pct_change().dropna()
+                mn = min(len(ret_sym), len(ret_btc))
+                if mn > 5:
+                    corr = ret_sym.tail(mn).corr(ret_btc.tail(mn))
+                    corr_score = WEIGHTS["correlation"] if corr > 0.6 else WEIGHTS["correlation"] * 0.5
+                else:
+                    corr_score = WEIGHTS["correlation"] * 0.3
+            else:
+                corr_score = WEIGHTS["correlation"] * 0.6
+        except Exception:
+            corr_score = WEIGHTS["correlation"] * 0.4
+        components["correlation"] = round(corr_score,3)
+        total += corr_score
+
+        # 16. monthly/weekly bias
+        mb_score = WEIGHTS["monthly_bias"] * 0.5
+        try:
+            if dfs.get("1d") is not None:
+                ma30 = dfs["1d"]["close"].rolling(window=30).mean().iloc[-1]
+                mb_score = WEIGHTS["monthly_bias"] if dfs["1d"]["close"].iloc[-1] > ma30 else WEIGHTS["monthly_bias"] * 0.3
+        except Exception:
+            mb_score = WEIGHTS["monthly_bias"] * 0.4
+        components["monthly_bias"] = round(mb_score,3)
+        total += mb_score
+
+        # 17. long/short ratio (proxy)
+        lsr = WEIGHTS["longshort_ratio"] * 0.6
+        components["longshort_ratio"] = round(lsr,3)
+        total += lsr
+
+        # 18. time-of-day
+        tod = WEIGHTS["time_of_day"] if 13 <= datetime.utcnow().hour <= 17 else WEIGHTS["time_of_day"] * 0.4
+        components["time_of_day"] = round(tod,3)
+        total += tod
+
+        # Section C (19..25) simplified
+        components["position_sizing"] = round(WEIGHTS["position_sizing"] * 0.6,3); total += WEIGHTS["position_sizing"] * 0.6
+        components["psych"] = round(WEIGHTS["psych"] * 0.8,3); total += WEIGHTS["psych"] * 0.8
+        components["backtest"] = round(WEIGHTS["backtest"] * 0.2,3); total += WEIGHTS["backtest"] * 0.2
+        components["regime"] = round(WEIGHTS["regime"] * 0.6,3); total += WEIGHTS["regime"] * 0.6
+        components["asset_specific"] = round(WEIGHTS["asset_specific"] * 0.7,3); total += WEIGHTS["asset_specific"] * 0.7
+        components["smart_money"] = round(WEIGHTS["smart_money"] * 0.6,3); total += WEIGHTS["smart_money"] * 0.6
+        components["ml"] = round(WEIGHTS["ml"] * 0.2,3); total += WEIGHTS["ml"] * 0.2
+
+        # clamp
+        total = max(0.0, min(total, MAX_SCORE))
+        probability = int(min(100, round((total / MAX_SCORE) * 100)))
+        if total >= SCORE_STRONG:
+            category = "STRONG"
+        elif total >= SCORE_GOOD:
+            category = "GOOD"
+        elif total >= SCORE_WEAK:
+            category = "WEAK"
+        else:
+            category = "NO_TRADE"
+
+        # direction: heuristics from components
+        long_votes = 0; short_votes = 0
+        # use several indicators to decide direction
+        try:
+            if components.get("rsi_value",0) >= 55: long_votes += 1
+            if components.get("macd",0) >= WEIGHTS["macd"] * 0.8: long_votes += 1
+            if components.get("vwap",0) >= WEIGHTS["vwap"] * 0.8: long_votes += 1
+        except Exception:
+            pass
+        # quick fallback using price vs EMA20
+        try:
+            ema20 = ema(df["close"], 20).iloc[-1]
+            if last_price > ema20: long_votes += 1
+            else: short_votes += 1
+        except Exception:
+            pass
+        direction = "NONE"
+        if long_votes > short_votes: direction = "LONG"
+        elif short_votes > long_votes: direction = "SHORT"
+
+        # entry/SL/TP based on ATR
+        try:
+            atr_val = atr(df["high"], df["low"], df["close"], window=14).iloc[-1]
+            entry = round(last_price, 8)
+            if direction == "LONG":
+                sl = round(entry - 2 * atr_val, 8)
+                tp1 = round(entry + 1 * atr_val, 8)
+                tp2 = round(entry + 2 * atr_val, 8)
+            elif direction == "SHORT":
+                sl = round(entry + 2 * atr_val, 8)
+                tp1 = round(entry - 1 * atr_val, 8)
+                tp2 = round(entry - 2 * atr_val, 8)
+            else:
+                sl = round(entry - 2 * atr_val, 8)
+                tp1 = round(entry + 1 * atr_val, 8)
+                tp2 = round(entry + 2 * atr_val, 8)
+        except Exception:
+            entry = round(last_price, 8)
+            sl = round(last_price * 0.98, 8)
+            tp1 = round(last_price * 1.01, 8)
+            tp2 = round(last_price * 1.02, 8)
+
+        details = {
+            "components": components,
+            "last_price": last_price
+        }
+
+        # save and return
+        save_signal(symbol, total, category, direction, probability, details)
+
+        return {
+            "symbol": symbol,
+            "score": round(total,2),
+            "probability": probability,
+            "category": category,
+            "direction": direction,
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "details": details
+        }
+
+    except Exception as e:
+        logger.exception("score_symbol error: %s", e)
+        return {"error": str(e)}
+
+# ---------------- message formatting (Persian) ----------------
+def format_message(symbol: str, out: Dict[str,Any]) -> str:
+    if "error" in out:
+        return f"⚠️ خطا در بررسی {symbol}: {out['error']}"
+    dir_label = "بی‌تصمیم"
+    if out["direction"] == "LONG": dir_label = "لانگ (خرید)"
+    if out["direction"] == "SHORT": dir_label = "شورت (فروش)"
+    header = f"📡 سیگنال برای: {symbol}\n⏰ تایم‌فریم: {TIMEFRAMES[0]}\n⚖️ وضعیت بازار: {dir_label}\n📊 امتیاز: {out['score']}/{MAX_SCORE}\n💯 درصد احتمال: {out['probability']}%\n"
+    body = f"➡️ ورود کلی: {out['entry']}\n🛑 حد ضرر کلی: {out['sl']}\n🎯 حد سود کلی (TP1): {out['tp1']}\n🎯 حد سود کلی (TP2): {out['tp2']}\n"
+    components = out.get("details", {}).get("components", {})
+    comp_lines = "\n".join([f"{k}: {v}" for k,v in list(components.items())[:6]])
+    footer = "\n⚠️ این سیگنال صرفاً تحلیلی است؛ مسئولیت معامله با شماست."
+    return header + body + "\n📊 خلاصه اندیکاتورها:\n" + comp_lines + footer
+
+# ---------------- Telegram helpers ----------------
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+def tg_send(chat_id: int, text: str):
     try:
-        await bot.delete_webhook()
+        url = f"{TG_API}/sendMessage"
+        res = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+        if not res.ok:
+            logger.error("Telegram send failed: %s %s", res.status_code, res.text)
+        return res
     except Exception:
-        pass
-    if _http_session and not _http_session.closed:
-        await _http_session.close()
-    await bot.session.close()
+        logger.exception("Failed to send tg message")
+        return None
 
+def set_telegram_webhook():
+    if not WEBHOOK_URL:
+        logger.warning("WEBHOOK_URL not set; skipping setWebhook")
+        return False
+    try:
+        url = f"{TG_API}/setWebhook"
+        r = requests.post(url, json={"url": WEBHOOK_URL}, timeout=15)
+        logger.info("setWebhook response: %s", r.text)
+        return r.ok
+    except Exception:
+        logger.exception("setWebhook failed")
+        return False
 
-# -------------------------
-# Run (webhook or polling)
-# -------------------------
+# ---------------- auto-scan loop ----------------
+def get_top_pairs(quote="USDT", top_n=100) -> List[str]:
+    tickers = get_24hr_tickers()
+    if not tickers:
+        return WATCHLIST
+    filt = [t for t in tickers if t.get("symbol","").endswith(quote)]
+    sorted_pairs = sorted(filt, key=lambda x: float(x.get("quoteVolume",0.0)), reverse=True)
+    return [p["symbol"] for p in sorted_pairs[:top_n]]
+
+def auto_scan_worker():
+    logger.info("Auto-scan worker started (top_n=%s interval=%s)", AUTO_SCAN_TOP_N, SCAN_INTERVAL_SECONDS)
+    while True:
+        try:
+            pairs = get_top_pairs(top_n=AUTO_SCAN_TOP_N) if AUTO_SCAN_TOP_N > 0 else WATCHLIST
+            for s in pairs:
+                try:
+                    out = score_symbol(s)
+                    if isinstance(out, dict) and "error" not in out:
+                        if out["category"] in ("STRONG","GOOD") or out["probability"] >= PROBABILITY_THRESHOLD:
+                            msg = format_message(s, out)
+                            tg_send(ADMIN_ID, msg)
+                except Exception:
+                    logger.exception("Error scanning %s", s)
+                time.sleep(0.25)
+        except Exception:
+            logger.exception("Auto-scan outer loop error")
+        time.sleep(SCAN_INTERVAL_SECONDS)
+
+# ---------------- Flask webhook server ----------------
+app = Flask(__name__)
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json(force=True)
+        if "message" in data:
+            msg = data["message"]
+            chat_id = msg["chat"]["id"]
+            text = msg.get("text","").strip()
+            if text.startswith("/scan"):
+                parts = text.split()
+                if len(parts) >= 2:
+                    sym = parts[1].upper()
+                    tg_send(chat_id, f"🔎 در حال بررسی {sym} ...")
+                    threading.Thread(target=lambda: tg_send(chat_id, format_message(sym, score_symbol(sym))), daemon=True).start()
+                else:
+                    tg_send(chat_id, "فرمت: /scan SYMBOL  — مثال: /scan BTCUSDT")
+            elif text.startswith("/status"):
+                parts = text.split()
+                if len(parts) >= 2:
+                    sym = parts[1].upper()
+                    tg_send(chat_id, f"🔎 وضعیت {sym} ...")
+                    threading.Thread(target=lambda: tg_send(chat_id, format_message(sym, score_symbol(sym))), daemon=True).start()
+                else:
+                    tg_send(chat_id, "فرمت: /status SYMBOL")
+            elif text.startswith("/start"):
+                tg_send(chat_id, "ربات آنالیز بازار فعال است. از /scan برای دریافت سیگنال استفاده کنید.")
+            else:
+                # if user writes symbol directly like "BTC" or "BTCUSDT"
+                s = text.upper().strip()
+                sym = s if s.endswith("USDT") else (s + "USDT")
+                if len(sym) > 4:
+                    tg_send(chat_id, f"🔎 در حال بررسی {sym} ...")
+                    threading.Thread(target=lambda: tg_send(chat_id, format_message(sym, score_symbol(sym))), daemon=True).start()
+                else:
+                    tg_send(chat_id, "دستور نامشخص. از /scan SYMBOL استفاده کنید.")
+    except Exception:
+        logger.exception("webhook handler error")
+    return jsonify(ok=True)
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+# ---------------- main entry ----------------
+def main():
+    # set webhook on Telegram if WEBHOOK_URL provided
+    if ENABLE_WEBHOOK and WEBHOOK_URL:
+        ok = set_telegram_webhook()
+        if not ok:
+            logger.warning("setWebhook returned not-OK. Ensure WEBHOOK_URL reachable by Telegram.")
+    # start auto-scan thread
+    if ENABLE_AUTO_SCAN:
+        t = threading.Thread(target=auto_scan_worker, daemon=True)
+        t.start()
+    logger.info("Starting Flask server on %s:%s (webhook_path=%s)", WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH)
+    app.run(host=WEBAPP_HOST, port=WEBAPP_PORT, threaded=True)
+
 if __name__ == "__main__":
-    if getattr(config, "ENABLE_WEBHOOK", False):
-        # webhook mode for Render (if configured)
-        start_webhook(
-            dispatcher=dp,
-            webhook_path=config.WEBHOOK_PATH,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            skip_updates=True,
-            host=config.WEBAPP_HOST,
-            port=config.WEBAPP_PORT,
-        )
-    else:
-        from aiogram import executor
-        executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
+    main()
