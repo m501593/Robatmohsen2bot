@@ -1,0 +1,3 @@
+# config.py
+TOKEN = "7993216439:AAHKSHJMHrcnfEcedw54aetp1JPxZ83Ks4M"
+ADMIN_ID = "84544682"
